@@ -1,41 +1,281 @@
-# Prerequisites
-*.d
+import discord
+from discord.ext import commands
+import requests
+import asyncio
+import json
+import os
+from datetime import datetime
+import time
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Khởi tạo bot với các intents cần thiết
+intents = discord.Intents.default()
+intents.guilds = True
+intents.messages = True
+intents.message_content = True
+intents.typing = True
 
-# Precompiled Headers
-*.gch
-*.pch
+bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Linker files
-*.ilk
+# Thay bằng token bot Discord và Guild ID của bạn
+DISCORD_TOKEN = 'MTQxODgyNzA2OTkxMTA3NjkyNA.GTlFHc.E3WJ6LSn_t75L_JsK-pm02rtU--uuCOjrgKxDA'
+GUILD_ID = '1418831047403241492Y'  # Guild ID của server DoA Store
+GEMINI_API_KEY = 'AIzaSyAd8mXxHWUDsLouHaYUDQors1LYqGzQ598'
+GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
 
-# Debugger Files
-*.pdb
+# Danh sách ID của các thread mục tiêu
+TARGET_THREAD_IDS = [
+    '1418831047403241492',  # Đoạn: 1
+    'ID Kênh 2',  # Đoạn: 2
+    'ID Kênh 3',  # Đoạn: 3
+    'ID Kênh 4',  # Đoạn: 4
+    'ID Kênh 5',  # Đoạn: 5
+]
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+# Lưu trữ ID của tin nhắn nhắc nhở cuối cùng trong mỗi thread
+last_reminder_messages = {}  # thread_id -> message_id
 
-# Fortran module files
-*.mod
-*.smod
+# Đường dẫn file lưu lịch sử chat
+CHAT_HISTORY_FILE = 'chat_history.json'
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+# Biến để theo dõi thời gian gửi yêu cầu API cuối cùng (để giới hạn tốc độ)
+last_api_call_time = 0
+API_RATE_LIMIT_SECONDS = 2  # Giới hạn: 1 yêu cầu mỗi 2 giây
 
-# Executables
-*.exe
-*.out
-*.app
+# Hàm tải lịch sử chat từ file JSON
+def load_chat_history():
+    if os.path.exists(CHAT_HISTORY_FILE):
+        with open(CHAT_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
 
-# debug information files
-*.dwo
+# Hàm lưu lịch sử chat vào file JSON
+def save_chat_history(history):
+    with open(CHAT_HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=4)
+
+# Khởi tạo lịch sử chat
+chat_history = load_chat_history()
+
+# Hàm cắt ngắn nội dung để không vượt quá 2000 ký tự
+def truncate_content(content, max_length=2000):
+    if len(content) <= max_length:
+        return content
+    return content[:max_length - 3] + '...'
+
+# Hàm chia nội dung thành nhiều phần, mỗi phần dưới 2000 ký tự
+def split_content(content, max_length=2000):
+    chunks = []
+    current_chunk = ''
+    lines = content.split('\n')
+    for line in lines:
+        if len(current_chunk) + len(line) + 1 > max_length:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = line
+        else:
+            current_chunk += ('\n' if current_chunk else '') + line
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+# Hàm gửi tin nhắn nhắc nhở và xóa tin nhắn cũ
+async def send_reminder_message(thread):
+    try:
+        # Xóa tin nhắn nhắc nhở cũ nếu có
+        last_message_id = last_reminder_messages.get(thread.id)
+        if last_message_id:
+            try:
+                last_message = await thread.fetch_message(last_message_id)
+                await last_message.delete()
+                print(f'Đã xóa tin nhắn nhắc nhở cũ trong thread: {thread.name}')
+            except Exception as e:
+                print(f'Không thể xóa tin nhắn nhắc nhở cũ trong thread {thread.name}: {e}')
+
+        # Gửi tin nhắn nhắc nhở mới
+        content = truncate_content(
+            'Bạn có thể chat trực tiếp với tôi trong thread này! Gửi bất kỳ tin nhắn nào để bắt đầu.'
+        )
+        new_message = await thread.send(content)
+
+        # Lưu ID của tin nhắn mới
+        last_reminder_messages[thread.id] = new_message.id
+        print(f'Đã gửi tin nhắn nhắc nhở mới trong thread: {thread.name}')
+    except Exception as e:
+        print(f'Lỗi khi gửi tin nhắn nhắc nhở trong thread {thread.name}: {e}')
+
+# Khi bot sẵn sàng
+@bot.event
+async def on_ready():
+    print(f'Đã đăng nhập với tên {bot.user}')
+
+    try:
+        # Lấy guild
+        guild = bot.get_guild(int(GUILD_ID))
+        if not guild:
+            print(f'Không tìm thấy server với ID {GUILD_ID}')
+            return
+
+        # Tìm các thread mục tiêu dựa trên ID
+        target_threads = []
+        for thread_id in TARGET_THREAD_IDS:
+            thread = guild.get_thread(int(thread_id))
+            if not thread:
+                print(f'Không tìm thấy thread với ID {thread_id}')
+                continue
+            if not isinstance(thread, (discord.Thread)):
+                print(f'ID {thread_id} không phải là thread.')
+                continue
+            target_threads.append(thread)
+
+        if not target_threads:
+            print('Không tìm thấy thread nào trong danh sách ID mục tiêu.')
+            return
+
+        # Gửi tin nhắn nhắc nhở vào các thread mục tiêu
+        for thread in target_threads:
+            # Mở thread nếu đã lưu trữ
+            if thread.archived:
+                await thread.edit(archived=False)
+                print(f'Đã mở thread: {thread.name}')
+            await send_reminder_message(thread)
+
+    except Exception as e:
+        print(f'Lỗi khi khởi động bot: {e}')
+
+# Xử lý khi có thread mới được tạo
+@bot.event
+async def on_thread_create(thread):
+    if str(thread.id) in TARGET_THREAD_IDS:
+        # Mở thread nếu đã lưu trữ
+        if thread.archived:
+            await thread.edit(archived=False)
+            print(f'Đã mở thread: {thread.name}')
+        await send_reminder_message(thread)
+
+# Xử lý khi có tin nhắn mới trong thread
+@bot.event
+async def on_message(message):
+    # Kiểm tra nếu tin nhắn nằm trong thread mục tiêu
+    if (message.channel.type != discord.ChannelType.public_thread or
+            str(message.channel.id) not in TARGET_THREAD_IDS):
+        return
+
+    # Lưu tin nhắn của người dùng hoặc bot vào lịch sử
+    thread_id = str(message.channel.id)
+    if thread_id not in chat_history:
+        chat_history[thread_id] = []
+
+    # Lưu tin nhắn
+    chat_entry = {
+        'user': message.author.name,
+        'content': message.content,
+        'timestamp': datetime.utcnow().isoformat()
+    }
+    chat_history[thread_id].append(chat_entry)
+    save_chat_history(chat_history)
+
+    # Nếu là tin nhắn từ bot, không xử lý thêm
+    if message.author.bot:
+        return
+
+    # Xử lý tin nhắn trực tiếp (chat bình thường)
+    question = message.content.strip()
+    if not question:
+        reply = 'Vui lòng gửi một tin nhắn có nội dung để tôi có thể trả lời!'
+        await message.channel.send(reply)
+
+        # Lưu phản hồi của bot
+        bot_entry = {
+            'user': bot.user.name,
+            'content': reply,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        chat_history[thread_id].append(bot_entry)
+        save_chat_history(chat_history)
+        return
+
+    # Kiểm tra giới hạn tốc độ API
+    global last_api_call_time
+    current_time = time.time()
+    time_since_last_call = current_time - last_api_call_time
+    if time_since_last_call < API_RATE_LIMIT_SECONDS:
+        wait_time = API_RATE_LIMIT_SECONDS - time_since_last_call
+        print(f'Đợi {wait_time:.2f} giây để tuân thủ giới hạn tốc độ API...')
+        await asyncio.sleep(wait_time)
+
+    # Cập nhật thời gian gọi API
+    last_api_call_time = time.time()
+
+    # Thử gọi API Gemini với cơ chế retry
+    max_retries = 3
+    retry_delay = 2  # seconds
+    for attempt in range(max_retries):
+        try:
+            # Gọi API Gemini
+            response = requests.post(
+                f'{GEMINI_API_URL}?key={GEMINI_API_KEY}',
+                json={
+                    'contents': [
+                        {
+                            'parts': [
+                                {
+                                    'text': f'You are a helpful assistant. Respond concisely in Vietnamese. {question}'
+                                }
+                            ]
+                        }
+                    ]
+                },
+                headers={'Content-Type': 'application/json'},
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Kiểm tra cấu trúc phản hồi
+            if 'candidates' not in data or not data['candidates']:
+                raise ValueError("Không tìm thấy 'candidates' trong phản hồi API")
+            if 'content' not in data['candidates'][0]:
+                raise ValueError("Không tìm thấy 'content' trong candidates[0]")
+            if 'parts' not in data['candidates'][0]['content'] or not data['candidates'][0]['content']['parts']:
+                raise ValueError("Không tìm thấy 'parts' trong content")
+            if 'text' not in data['candidates'][0]['content']['parts'][0]:
+                raise ValueError("Không tìm thấy 'text' trong parts[0]")
+
+            reply = data['candidates'][0]['content']['parts'][0]['text']
+
+            # Trả lời trực tiếp
+            message_chunks = split_content(reply)
+            for chunk in message_chunks:
+                await message.channel.send(chunk)
+
+                # Lưu từng phần phản hồi của bot
+                bot_entry = {
+                    'user': bot.user.name,
+                    'content': chunk,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                chat_history[thread_id].append(bot_entry)
+                save_chat_history(chat_history)
+
+            break  # Thoát vòng lặp nếu thành công
+
+        except Exception as e:
+            print(f'Lỗi khi xử lý tin nhắn (lần thử {attempt + 1}/{max_retries}): {str(e)}')
+            if attempt < max_retries - 1:
+                print(f'Thử lại sau {retry_delay} giây...')
+                await asyncio.sleep(retry_delay)
+            else:
+                reply = 'Xin lỗi, có lỗi xảy ra khi xử lý yêu cầu của bạn. Vui lòng kiểm tra lại.'
+                await message.channel.send(reply)
+
+                # Lưu phản hồi lỗi của bot
+                bot_entry = {
+                    'user': bot.user.name,
+                    'content': reply,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                chat_history[thread_id].append(bot_entry)
+                save_chat_history(chat_history)
+
+# Chạy bot
+bot.run(DISCORD_TOKEN)
